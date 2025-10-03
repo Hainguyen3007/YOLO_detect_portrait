@@ -1,0 +1,12 @@
+.venv
+output/
+test_tps/
+image/
+tests_api/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+locustfile.py
+
