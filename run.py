@@ -5,6 +5,8 @@ from typing import List
 import cv2
 import numpy as np
 import io
+import uuid
+import base64
 
 # Khởi tạo FastAPI
 app = FastAPI()
@@ -66,7 +68,8 @@ async def detect(file: UploadFile = File(...)):
     portrait_bgr = aligned_bgr[180:480, 15:220]
 
     # Encode ảnh ra PNG trong bộ nhớ
-    _, buffer = cv2.imencode(".png", portrait_bgr)
+    jpeg_quality = 80
+    _, buffer = cv2.imencode(".jpg", portrait_bgr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
     return StreamingResponse(io.BytesIO(buffer.tobytes()), media_type="image/png")
 
 
@@ -74,17 +77,30 @@ async def detect(file: UploadFile = File(...)):
 @app.post("/detect_batch")
 async def detect_batch(files: List[UploadFile] = File(...)):
     """
-    Nhận một batch (danh sách) ảnh, xử lý từng ảnh để detect và căn chỉnh thẻ,
-    sau đó cắt crop ảnh chân dung.
-    Kết quả trả về là JSON chứa trạng thái xử lý cho từng ảnh.
+    Nhận một batch ảnh, xử lý và trả về kết quả chi tiết cho từng ảnh,
+    bao gồm ảnh chân dung dưới dạng base64 khi thành công hoặc lỗi có cấu trúc khi thất bại.
     """
     if not files:
         raise HTTPException(status_code=400, detail="Không có tệp nào được tải lên.")
 
+    # Thêm ID duy nhất cho mỗi request, rất hữu ích cho việc log và debug
+    request_id = str(uuid.uuid4())
+
     batch_results = []
+    success_count = 0
+    failed_count = 0
 
     for file in files:
         file_name = file.filename
+
+        # Cấu trúc response nhất quán cho mỗi file
+        result_item = {
+            "file_name": file_name,
+            "status": None,
+            "data": None,
+            "error": None
+        }
+
         try:
             # 1. Đọc và giải mã ảnh
             file_bytes = await file.read()
@@ -92,7 +108,7 @@ async def detect_batch(files: List[UploadFile] = File(...)):
             img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
             if img_bgr is None:
-                raise ValueError("Không thể giải mã tệp thành ảnh.")
+                raise ValueError("Không thể giải mã tệp thành ảnh hợp lệ.")
 
             # 2. YOLO detect
             results = model(img_bgr)
@@ -111,32 +127,44 @@ async def detect_batch(files: List[UploadFile] = File(...)):
             # 4. Kiểm tra đủ 4 góc
             required = {"top_left", "top_right", "bottom_right", "bottom_left"}
             if not required.issubset(corner_boxes.keys()):
-                batch_results.append({
-                    "file_name": file_name,
-                    "status": "failed",
-                    "reason": "Không detect đủ 4 góc"
-                })
-                continue  # Chuyển sang ảnh tiếp theo
+                # Ném ra lỗi cụ thể để khối except có thể bắt được
+                raise ValueError(f"Không detect đủ 4 góc. Các góc tìm thấy: {list(corner_boxes.keys())}")
 
             # 5. Warp thẻ và Crop chân dung
             aligned_bgr = align_card(img_bgr, corner_boxes)
             portrait_bgr = aligned_bgr[180:480, 15:220]
 
-            # NOTE: Để đơn giản hóa output batch, ta chỉ trả về trạng thái thành công.
-            # Trong thực tế, bạn có thể cần lưu ảnh đã crop ra một thư mục,
-            # hoặc mã hóa nó thành base64 để trả về trong JSON (cần cẩn thận với kích thước response).
+            # 6. Mã hóa ảnh chân dung thành chuỗi base64
+            _, buffer = cv2.imencode(".png", portrait_bgr)
+            portrait_base64 = base64.b64encode(buffer).decode("utf-8")
 
-            batch_results.append({
-                "file_name": file_name,
-                "status": "success",
-                "message": "Xử lý thành công. Ảnh chân dung đã được crop."
-            })
+            # 7. Ghi nhận kết quả thành công
+            success_count += 1
+            result_item["status"] = "success"
+            result_item["data"] = {
+                "portrait_image_base64": portrait_base64
+            }
 
         except Exception as e:
-            batch_results.append({
-                "file_name": file_name,
-                "status": "failed",
-                "reason": f"Lỗi xử lý: {str(e)}"
-            })
+            # 8. Ghi nhận kết quả thất bại với lỗi có cấu trúc
+            failed_count += 1
+            result_item["status"] = "failed"
+            result_item["error"] = {
+                "code": "PROCESSING_ERROR",  # Mã lỗi để client dễ xử lý
+                "message": str(e)
+            }
 
-    return JSONResponse(batch_results)
+        batch_results.append(result_item)
+
+    # Cấu trúc JSON response cuối cùng, có thêm phần tóm tắt
+    final_response = {
+        "request_id": request_id,
+        "summary": {
+            "total_files": len(files),
+            "success_count": success_count,
+            "failed_count": failed_count
+        },
+        "results": batch_results
+    }
+
+    return JSONResponse(final_response)
